@@ -193,3 +193,10 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# Local experiment data and model weights
+results/
+/models/
+
+# Local-only notes and cloud-run scripts
+private/
