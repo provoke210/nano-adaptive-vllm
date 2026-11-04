@@ -1,0 +1,58 @@
+{
+  "frozen_at_utc": "2026-10-21T14:24:17.471791+00:00",
+  "source_sha256": "ad87323e586a3e28e538a65ace20dd3d2fbe78eb58ded3ce9bc7c3fd7fbaeaf5",
+  "training_seeds": [
+    7
+  ],
+  "heldout_seeds": [
+    101,
+    307
+  ],
+  "scenarios": [
+    "mixed",
+    "burst",
+    "pressure"
+  ],
+  "count": 24,
+  "repeats": 3,
+  "rate": 30,
+  "blocks": 64,
+  "max_seqs": 16,
+  "token_budget": 2048,
+  "ttft_slo_ms": 1000,
+  "tpot_slo_ms": 50,
+  "target_step_ms": 50,
+  "initial_budget": 2048,
+  "admission_wait_ms": 100,
+  "admission_target_ms": 800,
+  "admission_max_slots": 4,
+  "variants": [
+    "native",
+    "fixed-128",
+    "fixed-256",
+    "fixed-512",
+    "fixed-1024",
+    "fixed-2048",
+    "fixed-2048-admit",
+    "fixed-128-aware",
+    "fixed-256-aware",
+    "fixed-512-aware",
+    "fixed-1024-aware",
+    "fixed-2048-aware",
+    "cost",
+    "cost-aware"
+  ],
+  "policy": "No changes after heldout begins; report every scenario and negative result. Fixed-aware ablations isolate dynamic admission from dynamic token budgeting.",
+  "robustness": {
+    "blocks": 128,
+    "seeds": [
+      101,
+      307
+    ],
+    "scenarios": [
+      "pressure"
+    ],
+    "count": 24,
+    "repeats": 3
+  }
+}
