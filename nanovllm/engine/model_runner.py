@@ -6,10 +6,12 @@ from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
-from nanovllm.models.qwen3 import Qwen3ForCausalLM
+from nanovllm.models.registry import get_model_class
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
+from nanovllm.engine.input_buffers import DecodeInputBuffers
+from nanovllm.engine.profiling import StageProfiler
 
 
 class ModelRunner:
@@ -22,21 +24,43 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
+        self.profiler = StageProfiler()
+        self.decode_buffers = None
+        self._direct_decode_graph = False
+        self._decode_temperatures = None
+        self.dtype = (getattr(hf_config, "dtype", None) or getattr(hf_config, "torch_dtype", None)
+                      if config.dtype == "auto" else config.dtype)
+        if isinstance(self.dtype, str):
+            self.dtype = getattr(torch, self.dtype, None)
+        if self.dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError(f"Unsupported model dtype: {self.dtype}")
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
-        torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
-        torch.set_default_dtype(hf_config.dtype)
-        torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config)
-        load_model(self.model, config.model)
-        self.sampler = Sampler()
-        self.warmup_model()
-        self.allocate_kv_cache()
-        if not self.enforce_eager:
-            self.capture_cudagraph()
-        torch.set_default_device("cpu")
-        torch.set_default_dtype(default_dtype)
+        default_device = torch.get_default_device()
+        try:
+            torch.cuda.set_device(rank)
+            torch.set_default_dtype(self.dtype)
+            torch.set_default_device("cuda")
+            self.model = get_model_class(hf_config)(hf_config)
+            load_model(self.model, config.model)
+            for module in self.model.modules():
+                if hasattr(module, "batch_invariant"):
+                    module.batch_invariant = config.batch_invariant
+            self.sampler = Sampler()
+            self.decode_buffers = DecodeInputBuffers(config.max_num_seqs, config.max_model_len, self.block_size)
+            # Allocate for both A/B variants before sizing KV, keeping resources equal.
+            self.warmup_model()
+            self.allocate_kv_cache()
+            if not self.enforce_eager:
+                self.capture_cudagraph()
+        except BaseException:
+            reset_context()
+            dist.destroy_process_group()
+            raise
+        finally:
+            torch.set_default_device(default_device)
+            torch.set_default_dtype(default_dtype)
 
         if self.world_size > 1:
             if rank == 0:
@@ -108,9 +132,11 @@ class ModelRunner:
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
-        head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
+        head_dim = (getattr(hf_config, "head_dim", None) or hf_config.hidden_size // hf_config.num_attention_heads)
+        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * self.dtype.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
+        if config.kv_cache_block_cap is not None:
+            config.num_kvcache_blocks = min(config.num_kvcache_blocks, config.kv_cache_block_cap)
         assert config.num_kvcache_blocks > 0
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
         layer_id = 0
@@ -170,6 +196,14 @@ class ModelRunner:
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
+        if self.config.reuse_decode_buffers:
+            n, width = self.decode_buffers.fill(seqs)
+            self._direct_decode_graph = not self.enforce_eager and n <= 512
+            tensors = self.decode_buffers.upload(n, width)
+            self._decode_temperatures = tensors["temperatures"]
+            set_context(False, slot_mapping=tensors["slot_mapping"], context_lens=tensors["context_lens"],
+                        block_tables=tensors["block_tables"])
+            return tensors["input_ids"], tensors["positions"]
         input_ids = []
         positions = []
         slot_mapping = []
@@ -188,6 +222,9 @@ class ModelRunner:
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
+        if self._decode_temperatures is not None:
+            assert len(seqs) == self._decode_temperatures.numel()
+            return self._decode_temperatures
         temperatures = [seq.temperature for seq in seqs]
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
         return temperatures
@@ -201,37 +238,76 @@ class ModelRunner:
             context = get_context()
             graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
             graph_vars = self.graph_vars
-            graph_vars["input_ids"][:bs] = input_ids
-            graph_vars["positions"][:bs] = positions
-            graph_vars["slot_mapping"].fill_(-1)
-            graph_vars["slot_mapping"][:bs] = context.slot_mapping
-            graph_vars["context_lens"].zero_()
-            graph_vars["context_lens"][:bs] = context.context_lens
-            graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+            if not self._direct_decode_graph:
+                graph_vars["input_ids"][:bs] = input_ids
+                graph_vars["positions"][:bs] = positions
+                graph_vars["slot_mapping"].fill_(-1)
+                graph_vars["slot_mapping"][:bs] = context.slot_mapping
+                graph_vars["context_lens"].zero_()
+                graph_vars["context_lens"][:bs] = context.context_lens
+                graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        logits = self.run_model(input_ids, positions, is_prefill)
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
-        reset_context()
-        return token_ids
+        self._direct_decode_graph = False
+        self._decode_temperatures = None
+        trace = self.profiler.begin(is_prefill=is_prefill, batch_size=len(seqs),
+                    reuse=self.config.reuse_decode_buffers) if self.config.profile_stages else None
+        try:
+            input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+            sample_rows = [i for i, s in enumerate(seqs)
+                           if s.num_cached_tokens + s.num_scheduled_tokens == s.num_tokens]
+            if is_prefill:
+                ends = []
+                offset = 0
+                for s in seqs:
+                    offset += s.num_scheduled_tokens
+                    ends.append(offset - 1)
+                get_context().sample_indices = torch.tensor(
+                    [ends[i] for i in sample_rows], dtype=torch.long, device="cuda")
+            temperatures = self.prepare_sample([seqs[i] for i in sample_rows]) if self.rank == 0 else None
+            if trace:
+                trace.mark("prepare")
+            logits = self.run_model(input_ids, positions, is_prefill)
+            if trace:
+                trace.mark("model")
+            if self.rank != 0:
+                return None
+            sampled = self.sampler(logits, temperatures) if sample_rows else None
+            if trace:
+                trace.mark("sample")
+            values = sampled.tolist() if sampled is not None else []
+            if sampled is not None and self.decode_buffers is not None:
+                self.decode_buffers.mark_consumed()
+            if trace:
+                trace.mark("result_wait")
+                self.last_profile_trace = trace
+                self.profiler.submit(trace)
+            result = [None] * len(seqs)
+            for i, token in zip(sample_rows, values):
+                result[i] = token
+            return result
+        finally:
+            reset_context()
 
     @torch.inference_mode()
     def capture_cudagraph(self):
         config = self.config
         hf_config = config.hf_config
         max_bs = min(self.config.max_num_seqs, 512)
-        max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
-        input_ids = torch.zeros(max_bs, dtype=torch.int64)
-        positions = torch.zeros(max_bs, dtype=torch.int64)
-        slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
-        context_lens = torch.zeros(max_bs, dtype=torch.int32)
-        block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
+        # Both baseline and reuse graphs share this layout. Only the way the
+        # fields are populated per step differs between the A/B variants.
+        buffers = self.decode_buffers.gpu
+        self.decode_buffers.gpu_storage.zero_()
+        input_ids = buffers["input_ids"][:max_bs]
+        positions = buffers["positions"][:max_bs]
+        slot_mapping = buffers["slot_mapping"][:max_bs]
+        context_lens = buffers["context_lens"][:max_bs]
+        block_tables = buffers["block_tables"][:max_bs]
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
-        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        self.graph_bs = sorted({x for x in [1, 2, 4, 8] + list(range(16, max_bs + 1, 16)) + [max_bs]
+                                if x <= max_bs})
         self.graphs = {}
         self.graph_pool = None
 
