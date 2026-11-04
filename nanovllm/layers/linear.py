@@ -20,6 +20,7 @@ class LinearBase(nn.Module):
     ):
         super().__init__()
         self.tp_dim = tp_dim
+        self.batch_invariant = False
         self.tp_rank = dist.get_rank()
         self.tp_size = dist.get_world_size()
         self.weight = nn.Parameter(torch.empty(output_size, input_size))
@@ -32,6 +33,12 @@ class LinearBase(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
+
+    def linear(self, x, weight, bias=None):
+        if self.batch_invariant:
+            from nanovllm.layers.invariant import invariant_linear
+            return invariant_linear(x, weight, bias)
+        return F.linear(x, weight, bias)
 
 
 class ReplicatedLinear(LinearBase):
@@ -48,7 +55,7 @@ class ReplicatedLinear(LinearBase):
         param.data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.linear(x, self.weight, self.bias)
+        return self.linear(x, self.weight, self.bias)
 
 
 class ColumnParallelLinear(LinearBase):
@@ -70,7 +77,7 @@ class ColumnParallelLinear(LinearBase):
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.linear(x, self.weight, self.bias)
+        return self.linear(x, self.weight, self.bias)
 
 
 class MergedColumnParallelLinear(ColumnParallelLinear):
@@ -150,7 +157,7 @@ class RowParallelLinear(LinearBase):
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
+        y = self.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
         if self.tp_size > 1:
             dist.all_reduce(y)
         return y

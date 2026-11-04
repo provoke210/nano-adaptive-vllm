@@ -52,13 +52,18 @@ class ParallelLMHead(VocabParallelEmbedding):
     ):
         assert not bias
         super().__init__(num_embeddings, embedding_dim)
+        self.batch_invariant = False
 
     def forward(self, x: torch.Tensor):
         context = get_context()
         if context.is_prefill:
-            last_indices = context.cu_seqlens_q[1:] - 1
+            last_indices = context.sample_indices if context.sample_indices is not None else context.cu_seqlens_q[1:] - 1
             x = x[last_indices].contiguous()
-        logits = F.linear(x, self.weight)
+        if self.batch_invariant:
+            from nanovllm.layers.invariant import invariant_linear
+            logits = invariant_linear(x, self.weight, output_dtype=torch.float32)
+        else:
+            logits = F.linear(x, self.weight)
         if self.tp_size > 1:
             all_logits = [torch.empty_like(logits) for _ in range(self.tp_size)] if self.tp_rank == 0 else None
             dist.gather(logits, all_logits, 0)
