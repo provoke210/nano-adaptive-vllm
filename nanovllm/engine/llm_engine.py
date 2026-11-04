@@ -1,14 +1,17 @@
 import atexit
+import gc
 from dataclasses import fields
 from time import perf_counter
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 import torch.multiprocessing as mp
+import torch
 
 from nanovllm.config import Config
+from nanovllm.utils.generation import resolve_eos_token_ids
 from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence
-from nanovllm.engine.scheduler import Scheduler
+from nanovllm.engine.adaptive_scheduler import make_scheduler
 from nanovllm.engine.model_runner import ModelRunner
 
 
@@ -18,6 +21,9 @@ class LLMEngine:
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
+        self.config = config
+        self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
+        config.eos = resolve_eos_token_ids(config.model, config.hf_config, self.tokenizer)
         Sequence.block_size = config.kvcache_block_size
         self.ps = []
         self.events = []
@@ -29,28 +35,52 @@ class LLMEngine:
             self.ps.append(process)
             self.events.append(event)
         self.model_runner = ModelRunner(config, 0, self.events)
-        self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
-        config.eos = self.tokenizer.eos_token_id
-        self.scheduler = Scheduler(config)
+        self.scheduler = make_scheduler(config)
+        self.last_step = {}
         atexit.register(self.exit)
 
     def exit(self):
+        if not hasattr(self, "model_runner"):
+            return
         self.model_runner.call("exit")
         del self.model_runner
         for p in self.ps:
             p.join()
+        atexit.unregister(self.exit)
+        # Parameters hold bound weight_loader callbacks, which form cycles
+        # with their owning layers. Reclaim them before another model loads.
+        gc.collect()
+        torch.cuda.empty_cache()
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
         seq = Sequence(prompt, sampling_params)
         self.scheduler.add(seq)
+        return seq
 
     def step(self):
+        t = perf_counter()
         seqs, is_prefill = self.scheduler.schedule()
+        scheduled_at = perf_counter() if self.config.profile_stages else None
+        prefill_tokens = sum(s.num_scheduled_tokens for s in seqs if s.is_prefill)
+        decode_tokens = sum(s.num_scheduled_tokens for s in seqs if not s.is_prefill)
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
+        runner_at = perf_counter() if self.config.profile_stages else None
         token_ids = self.model_runner.call("run", seqs, is_prefill)
+        post_at = perf_counter() if self.config.profile_stages else None
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
+        finished_at = perf_counter()
+        elapsed_ms = (finished_at - t) * 1000
+        if self.config.profile_stages:
+            self.model_runner.last_profile_trace.record["engine_cpu_ms"] = dict(
+                schedule=(scheduled_at-t)*1000, bookkeeping=(runner_at-scheduled_at)*1000,
+                runner=(post_at-runner_at)*1000, postprocess=(finished_at-post_at)*1000)
+        self.scheduler.observe(elapsed_ms, prefill_tokens)
+        self.last_step = dict(elapsed_ms=elapsed_ms, prefill_tokens=prefill_tokens,
+                              decode_tokens=decode_tokens,
+                              used_blocks=len(self.scheduler.block_manager.used_block_ids),
+                              **getattr(self.scheduler, "last_decision", {}))
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         return outputs, num_tokens
 

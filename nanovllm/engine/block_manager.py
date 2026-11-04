@@ -55,7 +55,7 @@ class BlockManager:
         self.used_block_ids.remove(block_id)
         self.free_block_ids.append(block_id)
 
-    def can_allocate(self, seq: Sequence) -> int:
+    def can_allocate(self, seq: Sequence, reserve: int = 0) -> int:
         h = -1
         num_cached_blocks = 0
         num_new_blocks = seq.num_blocks
@@ -68,7 +68,7 @@ class BlockManager:
             num_cached_blocks += 1
             if block_id in self.used_block_ids:
                 num_new_blocks -= 1
-        if len(self.free_block_ids) < num_new_blocks:
+        if len(self.free_block_ids) < num_new_blocks + reserve:
             return -1
         return num_cached_blocks
 

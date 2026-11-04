@@ -1,13 +1,18 @@
 from collections import deque
+from time import perf_counter
+from typing import TYPE_CHECKING
 
-from nanovllm.config import Config
+if TYPE_CHECKING:
+    from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.block_manager import BlockManager
 
 
 class Scheduler:
 
-    def __init__(self, config: Config):
+    def __init__(self, config: "Config", clock=perf_counter):
+        self.clock = clock
+        self.config = config
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
@@ -16,11 +21,41 @@ class Scheduler:
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
 
+    @property
+    def eos(self):
+        return self._eos
+
+    @eos.setter
+    def eos(self, value):
+        self._eos = value
+        self.eos_token_ids = frozenset(value if isinstance(value, (list, tuple)) else [value])
+
     def is_finished(self):
         return not self.waiting and not self.running
 
     def add(self, seq: Sequence):
+        if seq.block_size != self.block_size:
+            raise ValueError("Sequence and cache block sizes must match")
+        if seq.num_tokens + seq.max_tokens > self.config.max_model_len:
+            raise ValueError("prompt + max_tokens exceeds max_model_len")
+        needed = (seq.num_tokens + seq.max_tokens - 2) // self.block_size + 1
+        if needed > len(self.block_manager.blocks):
+            raise ValueError("request cannot fit KV pool even when running alone")
+        seq.arrival_time = self.clock()
         self.waiting.append(seq)
+
+    def cancel(self, seq_id: int) -> bool:
+        for queue in (self.waiting, self.running):
+            for seq in list(queue):
+                if seq.seq_id == seq_id:
+                    queue.remove(seq)
+                    self.block_manager.deallocate(seq)
+                    seq.status = SequenceStatus.FINISHED
+                    return True
+        return False
+
+    def observe(self, elapsed_ms: float, prefill_tokens: int):
+        pass
 
     def schedule(self) -> tuple[list[Sequence], bool]:
         scheduled_seqs = []
@@ -73,20 +108,29 @@ class Scheduler:
         return scheduled_seqs, False
 
     def preempt(self, seq: Sequence):
+        seq.preemptions += 1
+        seq.recompute_until = max(seq.recompute_until, seq.num_cached_tokens)
         seq.status = SequenceStatus.WAITING
         seq.is_prefill = True
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
+        if len(seqs) != len(token_ids):
+            raise ValueError("runner returned the wrong number of results")
         for seq, token_id in zip(seqs, token_ids):
+            seq.recomputed_tokens += max(0, min(seq.num_cached_tokens + seq.num_scheduled_tokens,
+                                               seq.recompute_until) - seq.num_cached_tokens)
             self.block_manager.hash_blocks(seq)
             seq.num_cached_tokens += seq.num_scheduled_tokens
             seq.num_scheduled_tokens = 0
             if is_prefill and seq.num_cached_tokens < seq.num_tokens:
                 continue
+            if token_id is None:
+                raise ValueError("missing sampled token for a completed chunk")
             seq.append_token(token_id)
-            if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
+            seq.token_times.append(self.clock())
+            if (not seq.ignore_eos and token_id in self.eos_token_ids) or seq.num_completion_tokens == seq.max_tokens:
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
                 self.running.remove(seq)
